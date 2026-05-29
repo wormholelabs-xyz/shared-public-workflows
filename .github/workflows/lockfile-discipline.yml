@@ -29,7 +29,7 @@ jobs:
           # Read per-repo config if present, otherwise default to 72 hours
           MIN_AGE_SECS=259200
           if [ -f ".github/lockfile-discipline.toml" ]; then
-              val="$(perl -ne 'if (/^\s*minimum_release_age_seconds\s*=\s*(\d+)/) { print "$1\n"; exit }' .github/lockfile-discipline.toml)"
+              val="$(perl -ne 'if (/^\s*minimum_release_age_seconds\s*=\s*([\d_]+)/) { (my $v = $1) =~ s/_//g; print "$v\n"; exit }' .github/lockfile-discipline.toml)"
               [ -n "$val" ] && MIN_AGE_SECS="$val"
           fi
           min_age_days=$(( (MIN_AGE_SECS + 86399) / 86400 ))
@@ -51,14 +51,24 @@ jobs:
                   search="$(dirname "$search")"
               done
               if [ "$found" -eq 0 ]; then
-                  echo "::error file=${pkg}::No lock file found (expected package-lock.json, bun.lock, bun.lockb, yarn.lock, or pnpm-lock.yaml in this directory or any ancestor)"
+                  echo "::error file=${pkg}::No lock file found for ${pkg} — add package-lock.json, bun.lock, bun.lockb, yarn.lock, or pnpm-lock.yaml to ${dir}/"
                   errors=$((errors + 1))
               fi
           done < <(find . -name "package.json" -not -path "*/node_modules/*" -not -path "*/.git/*")
 
           # ── Check 2: Cargo.toml → Cargo.lock (workspace-aware) ─────────────────
+          # Workspace roots must have a sibling Cargo.lock — ancestor walk is wrong
+          # here because Cargo does not support nested workspaces, so any ancestor
+          # Cargo.lock belongs to a different independent workspace.
           while IFS= read -r toml; do
               dir="$(dirname "$toml")"
+              if grep -q '^\[workspace' "$toml" 2>/dev/null; then
+                  if [ ! -f "$dir/Cargo.lock" ]; then
+                      echo "::error file=${toml}::Cargo workspace root has no sibling Cargo.lock — add Cargo.lock to ${dir}/"
+                      errors=$((errors + 1))
+                  fi
+                  continue
+              fi
               found=0
               search="$dir"
               while true; do
@@ -70,21 +80,24 @@ jobs:
                   search="$(dirname "$search")"
               done
               if [ "$found" -eq 0 ]; then
-                  echo "::error file=${toml}::No Cargo.lock found (checked this directory and all ancestors)"
+                  echo "::error file=${toml}::No Cargo.lock found for ${toml} — add Cargo.lock to ${dir}/"
                   errors=$((errors + 1))
               fi
           done < <(find . -name "Cargo.toml" -not -path "*/.git/*")
 
           # ── Check 3: bun.lock / bun.lockb → bunfig.toml minimumReleaseAge ──────
+          # Bun only loads bunfig.toml from the project root (alongside package.json)
+          # or $HOME/.bunfig.toml — it does NOT walk ancestor directories.
+          # https://bun.sh/docs/runtime/bunfig
           while IFS= read -r lockfile; do
               dir="$(dirname "$lockfile")"
               bunfig="$dir/bunfig.toml"
               if [ ! -f "$bunfig" ]; then
-                  echo "::error file=${lockfile}::Bun lock file found but no sibling bunfig.toml — add [install].minimumReleaseAge"
+                  echo "::error file=${lockfile}::Bun lock file found but ${bunfig} does not exist — add [install].minimumReleaseAge to it"
                   errors=$((errors + 1))
                   continue
               fi
-              age="$(perl -ne '$in=0 if /^\[/; $in=1 if /^\[install\]/; if ($in && /^\s*minimumReleaseAge\s*=\s*(\d+)/) { print "$1\n"; exit }' "$bunfig")"
+              age="$(perl -ne '$in=0 if /^\[/; $in=1 if /^\[install\]/; if ($in && /^\s*minimumReleaseAge\s*=\s*([\d_]+)/) { (my $v = $1) =~ s/_//g; print "$v\n"; exit }' "$bunfig")"
               if [ -z "$age" ]; then
                   echo "::error file=${bunfig}::Missing [install].minimumReleaseAge in bunfig.toml"
                   errors=$((errors + 1))
@@ -112,19 +125,19 @@ jobs:
                   search="$(dirname "$search")"
               done
               if [ -z "$npmrc" ]; then
-                  echo "::error file=${lockfile}::No .npmrc found (checked this directory and all ancestors) — add min-release-age"
+                  echo "::error file=${lockfile}::No .npmrc found for ${lockfile} — add min-release-age to ${dir}/.npmrc or a parent .npmrc"
                   errors=$((errors + 1))
                   return
               fi
               local age_raw
               age_raw="$(grep -E '^min-release-age[[:space:]]*=' "$npmrc" | head -1 | sed 's/.*=[[:space:]]*//' | grep -oE '^[0-9]+')"
               if [ -z "$age_raw" ]; then
-                  echo "::error file=${npmrc}::Missing or unparseable min-release-age in .npmrc"
+                  echo "::error file=${npmrc}::${npmrc} does not set min-release-age — add min-release-age = ${min_age_days}"
                   errors=$((errors + 1))
                   return
               fi
               if [ "$age_raw" -lt "$min_age_days" ]; then
-                  echo "::error file=${npmrc}::min-release-age is ${age_raw} day(s) but the minimum required is ${min_age_days} day(s) (from ${MIN_AGE_SECS}s)"
+                  echo "::error file=${npmrc}::${npmrc} sets min-release-age = ${age_raw} day(s) but the minimum required is ${min_age_days} day(s) (${MIN_AGE_SECS}s)"
                   errors=$((errors + 1))
               fi
           }
