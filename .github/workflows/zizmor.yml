@@ -23,7 +23,14 @@ jobs:
               with:
                   persist-credentials: false
 
+            - name: Check for auditable inputs
+              id: check
+              run: |
+                  count=$(find .github/workflows .github/actions -name '*.yml' -o -name '*.yaml' 2>/dev/null | wc -l)
+                  echo "count=$count" >> "$GITHUB_OUTPUT"
+
             - name: Run zizmor
+              if: steps.check.outputs.count > 0
               uses: zizmorcore/zizmor-action@71321a20a9ded102f6e9ce5718a2fcec2c4f70d8 # v0.5.2
               with:
                   advanced-security: false
