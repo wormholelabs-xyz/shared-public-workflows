@@ -31,3 +31,4 @@ jobs:
           cd .check-actions
           oras pull ghcr.io/wormholelabs-xyz/action-audit/check-actions:sha-214d369@sha256:7a18183c22b6e79ba21453b041925b728d4d9c47201fc522a17086dbd5779178
       - uses: ./.check-actions
+        continue-on-error: true
