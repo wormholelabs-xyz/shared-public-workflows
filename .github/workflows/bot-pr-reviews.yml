@@ -1,13 +1,20 @@
 name: Bot PR Reviews
 
-# When a pull request contains changes not attributed to a person (opened by a
-# bot, or containing commits authored or committed by a bot or by an identity
-# not linked to a GitHub account), require one more approval than the base
-# branch's ruleset requires. Otherwise a user with write access could have a
-# bot write the change and approve it themselves, bypassing peer review.
+# When a pull request contains changes not attributed to a person with write
+# access, require one more approval than the base branch's ruleset requires.
+# Otherwise a user with write access could have a bot (or another account)
+# write the change and approve it themselves, bypassing peer review.
+#
+# A PR needs the extra approval when any of these lack write access to the
+# repository, are bots, or aren't linked to a GitHub account:
+#   - the PR author
+#   - the author or committer of any commit on the PR
+# It also needs the extra approval when any commit lacks a verified signature,
+# since an unsigned commit can name anyone as its author and committer.
 #
 # This generalizes GitHub's "additional approval for unattributed Copilot pull
-# requests" ruleset setting to any bot.
+# requests" ruleset setting to any bot, and also applies it to outside
+# contributors.
 #
 # Requires the ruleset's pull request rule to also enable:
 #   - "Dismiss stale pull request approvals when new commits are pushed", so
@@ -54,6 +61,14 @@ jobs:
                       exit 0
                   fi
 
+                  # Logs are public on public repos, so never log which accounts do or don't have write access.
+                  has_write() {
+                      case "$(gh api "repos/$REPO/collaborators/$1/permission" --jq .permission 2>/dev/null || echo none)" in
+                          admin|write) return 0 ;;
+                          *) return 1 ;;
+                      esac
+                  }
+
                   # Read the PR live rather than from the event payload, which re-runs reuse and which
                   # goes stale if the base branch is changed.
                   pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
@@ -61,21 +76,53 @@ jobs:
                   PR_AUTHOR_TYPE=$(jq -r '.user.type' <<< "$pr")
                   BASE_REF=$(jq -r '.base.ref' <<< "$pr")
 
-                  # Commits whose author or committer is a bot, or isn't linked to a GitHub account.
-                  # The PR commits API returns at most 250 commits, so treat a full list as unattributed.
-                  unattributed=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
-                      | jq -s -r '
-                          add
-                          | if length >= 250 then "(250+ commits, unable to inspect all)"
-                            else map(select(
-                                .author == null or .committer == null
-                                or .author.type == "Bot" or .committer.type == "Bot"))
-                              | map("\(.sha[0:7]) (author: \(.author.login // .commit.author.email), committer: \(.committer.login // .commit.committer.email))")
-                              | .[]
-                            end')
+                  commits=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" | jq -s -c 'add')
 
-                  if [[ "$PR_AUTHOR_TYPE" != "Bot" && -z "$unattributed" ]]; then
-                      echo "PR author $PR_AUTHOR is not a bot and all commits are attributed to people, nothing to check."
+                  reasons=()
+
+                  if [[ "$PR_AUTHOR_TYPE" == "Bot" ]]; then
+                      reasons+=("PR was opened by a bot")
+                  elif ! has_write "$PR_AUTHOR"; then
+                      reasons+=("PR was opened by an external contributor")
+                  fi
+
+                  # The PR commits API returns at most 250 commits, so a full list can't be fully inspected.
+                  if (( $(jq 'length' <<< "$commits") >= 250 )); then
+                      reasons+=("PR has 250+ commits, unable to inspect all")
+                  fi
+
+                  if jq -e 'any(.[]; .author == null or .committer == null)' <<< "$commits" > /dev/null; then
+                      reasons+=("commits authored or committed by an identity not linked to a GitHub account")
+                  fi
+
+                  # Without a verified signature, a commit's author and committer can name anyone. The ruleset's
+                  # signed commits requirement doesn't cover PR branches when squash merging, as GitHub signs
+                  # the squashed commit itself.
+                  if jq -e 'any(.[]; .commit.verification.verified != true)' <<< "$commits" > /dev/null; then
+                      reasons+=("commits without a verified signature")
+                  fi
+
+                  if jq -e 'any(.[]; .author.type? == "Bot" or .committer.type? == "Bot")' <<< "$commits" > /dev/null; then
+                      reasons+=("commits authored or committed by a bot")
+                  fi
+
+                  # web-flow is the committer GitHub uses for commits made through the web UI or API. GitHub only signs
+                  # these when the author is the authenticated user, so the author is trusted for verified commits.
+                  commit_accounts=$(jq -r '
+                      [.[] | .author, (.committer | select(.login? != "web-flow"))]
+                      | map(select(. != null and .type != "Bot") | .login)
+                      | unique
+                      | .[]' <<< "$commits")
+                  while read -r login; do
+                      [[ -z "$login" ]] && continue
+                      if ! has_write "$login"; then
+                          reasons+=("commits authored or committed by an external contributor")
+                          break
+                      fi
+                  done <<< "$commit_accounts"
+
+                  if (( ${#reasons[@]} == 0 )); then
+                      echo "No extra approval required."
                       exit 0
                   fi
 
@@ -99,34 +146,27 @@ jobs:
                           | .[]')
 
                   # Only count approvals from users with write access, as GitHub does.
-                  # Logs are public on public repos, so don't reveal whose approvals count.
                   counted=0
                   while read -r login; do
                       [[ -z "$login" ]] && continue
-                      permission=$(gh api "repos/$REPO/collaborators/$login/permission" --jq .permission 2>/dev/null || echo none)
-                      case "$permission" in
-                          admin|write) counted=$((counted + 1)) ;;
-                      esac
+                      if has_write "$login"; then
+                          counted=$((counted + 1))
+                      fi
                   done <<< "$approvers"
 
                   {
                       echo "### Bot PR reviews"
                       echo ""
-                      echo "PR #$PR_NUMBER contains changes not attributed to a person."
+                      echo "PR #$PR_NUMBER requires $required approval(s) from reviewers with write access (the ruleset's $ruleset_required plus one) because:"
                       echo ""
-                      echo "- PR author: \`$PR_AUTHOR\` ($PR_AUTHOR_TYPE)"
-                      if [[ -n "$unattributed" ]]; then
-                          echo "- Unattributed commits:"
-                          while read -r line; do echo "  - $line"; done <<< "$unattributed"
-                      fi
-                      echo "- Ruleset required approvals: $ruleset_required"
-                      echo "- Required approvals: $required"
-                      echo "- Qualifying approvals: $counted"
+                      for reason in "${reasons[@]}"; do echo "- $reason"; done
+                      echo ""
+                      echo "Approvals from reviewers with write access: $counted of $required"
                   } >> "$GITHUB_STEP_SUMMARY"
 
                   if (( counted < required )); then
-                      echo "::error::PR contains changes not attributed to a person and has $counted qualifying approval(s) but requires $required (ruleset requirement of $ruleset_required plus one). See the job summary for details. Reviews do not re-run this check, so re-run it after new approvals are submitted."
+                      echo "::error::PR requires $required approval(s) from reviewers with write access (the ruleset's $ruleset_required plus one) and has $counted. See the job summary for details. Reviews do not re-run this check, so re-run it after new approvals are submitted."
                       exit 1
                   fi
 
-                  echo "PR has $counted of $required required approval(s)."
+                  echo "PR has $counted of $required required approval(s) from reviewers with write access."
