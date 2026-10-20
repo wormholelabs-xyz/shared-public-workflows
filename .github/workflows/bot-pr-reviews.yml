@@ -1,0 +1,132 @@
+name: Bot PR Reviews
+
+# When a pull request contains changes not attributed to a person (opened by a
+# bot, or containing commits authored or committed by a bot or by an identity
+# not linked to a GitHub account), require one more approval than the base
+# branch's ruleset requires. Otherwise a user with write access could have a
+# bot write the change and approve it themselves, bypassing peer review.
+#
+# This generalizes GitHub's "additional approval for unattributed Copilot pull
+# requests" ruleset setting to any bot.
+#
+# Requires the ruleset's pull request rule to also enable:
+#   - "Dismiss stale pull request approvals when new commits are pushed", so
+#     approvals given before a later bot push no longer count.
+#   - "Require approval of the most recent reviewable push", so a person who
+#     pushes their own commits to someone else's PR can't approve them.
+#
+# This workflow is run by an org ruleset, which only triggers on the default
+# activity types of pull_request (opened, synchronize, reopened) and
+# merge_group. Reviews and base branch changes do not re-run this check, so
+# after approvals are submitted it must be re-run manually to pass.
+# See https://docs.github.com/en/enterprise-server@3.19/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/troubleshooting-rules
+
+on:
+    pull_request:
+    merge_group:
+
+permissions: {}
+
+# Queue rather than cancel, so the most recent event's result is the one that sticks.
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: false
+
+jobs:
+    bot-pr-reviews:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            pull-requests: read
+        steps:
+            - name: Check approvals
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  EVENT_NAME: ${{ github.event_name }}
+                  REPO: ${{ github.repository }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
+              run: |
+                  set -euo pipefail
+
+                  # PRs can't enter the merge queue without this check passing on the PR.
+                  if [[ -z "$PR_NUMBER" ]]; then
+                      echo "Not a pull request event ($EVENT_NAME), nothing to check."
+                      exit 0
+                  fi
+
+                  # Read the PR live rather than from the event payload, which re-runs reuse and which
+                  # goes stale if the base branch is changed.
+                  pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+                  PR_AUTHOR=$(jq -r '.user.login' <<< "$pr")
+                  PR_AUTHOR_TYPE=$(jq -r '.user.type' <<< "$pr")
+                  BASE_REF=$(jq -r '.base.ref' <<< "$pr")
+
+                  # Commits whose author or committer is a bot, or isn't linked to a GitHub account.
+                  # The PR commits API returns at most 250 commits, so treat a full list as unattributed.
+                  unattributed=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
+                      | jq -s -r '
+                          add
+                          | if length >= 250 then "(250+ commits, unable to inspect all)"
+                            else map(select(
+                                .author == null or .committer == null
+                                or .author.type == "Bot" or .committer.type == "Bot"))
+                              | map("\(.sha[0:7]) (author: \(.author.login // .commit.author.email), committer: \(.committer.login // .commit.committer.email))")
+                              | .[]
+                            end')
+
+                  if [[ "$PR_AUTHOR_TYPE" != "Bot" && -z "$unattributed" ]]; then
+                      echo "PR author $PR_AUTHOR is not a bot and all commits are attributed to people, nothing to check."
+                      exit 0
+                  fi
+
+                  # Highest required approval count across all active pull_request rules on the base branch.
+                  ruleset_required=$(gh api --paginate "repos/$REPO/rules/branches/$BASE_REF?per_page=100" \
+                      | jq -s '[add[] | select(.type == "pull_request") | .parameters.required_approving_review_count] | max // 0')
+                  required=$((ruleset_required + 1))
+
+                  # Latest approve/request-changes/dismiss state per non-bot reviewer, mirroring how GitHub counts reviews.
+                  approvers=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" \
+                      | jq -s -r --arg author "$PR_AUTHOR" '
+                          add
+                          | map(select(
+                              .user != null
+                              and .user.type != "Bot"
+                              and .user.login != $author
+                              and (.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")))
+                          | group_by(.user.login)
+                          | map(max_by(.id))
+                          | map(select(.state == "APPROVED") | .user.login)
+                          | .[]')
+
+                  # Only count approvals from users with write access, as GitHub does.
+                  # Logs are public on public repos, so don't reveal whose approvals count.
+                  counted=0
+                  while read -r login; do
+                      [[ -z "$login" ]] && continue
+                      permission=$(gh api "repos/$REPO/collaborators/$login/permission" --jq .permission 2>/dev/null || echo none)
+                      case "$permission" in
+                          admin|write) counted=$((counted + 1)) ;;
+                      esac
+                  done <<< "$approvers"
+
+                  {
+                      echo "### Bot PR reviews"
+                      echo ""
+                      echo "PR #$PR_NUMBER contains changes not attributed to a person."
+                      echo ""
+                      echo "- PR author: \`$PR_AUTHOR\` ($PR_AUTHOR_TYPE)"
+                      if [[ -n "$unattributed" ]]; then
+                          echo "- Unattributed commits:"
+                          while read -r line; do echo "  - $line"; done <<< "$unattributed"
+                      fi
+                      echo "- Ruleset required approvals: $ruleset_required"
+                      echo "- Required approvals: $required"
+                      echo "- Qualifying approvals: $counted"
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+                  if (( counted < required )); then
+                      echo "::error::PR contains changes not attributed to a person and has $counted qualifying approval(s) but requires $required (ruleset requirement of $ruleset_required plus one). See the job summary for details. Reviews do not re-run this check, so re-run it after new approvals are submitted."
+                      exit 1
+                  fi
+
+                  echo "PR has $counted of $required required approval(s)."
